@@ -3,6 +3,7 @@ import uuid
 from sqlalchemy import Column, String, Boolean, Integer, DateTime, Index
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.sql import func
+from sqlalchemy.orm import relationship
 
 from app.database.connection import Base
 
@@ -43,6 +44,9 @@ class Resume(Base):
         onupdate=func.now(),
         nullable=False
     )
+
+    # Relationship to sections (will be defined after ResumeSection is imported)
+    sections = relationship("ResumeSection", back_populates="resume", cascade="all, delete-orphan")
 
     # Indexes for performance
     __table_args__ = (

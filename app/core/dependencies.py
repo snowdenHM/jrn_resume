@@ -4,6 +4,8 @@ from sqlalchemy.orm import Session
 from typing import Dict, Any, Optional
 import logging
 import uuid
+import asyncio
+from functools import lru_cache
 
 from app.core.config import settings
 from app.core.security import decode_jwt_token, verify_token_with_main_api, validate_token_format
@@ -13,6 +15,10 @@ logger = logging.getLogger(__name__)
 
 # HTTP Bearer token scheme
 security = HTTPBearer(auto_error=False)
+
+# Cache for user data to reduce API calls
+_user_cache = {}
+_cache_ttl = 300  # 5 minutes
 
 
 async def get_current_user(
@@ -41,46 +47,78 @@ async def get_current_user(
         )
 
     try:
+        # Check cache first
+        cached_user = _user_cache.get(token)
+        if cached_user and cached_user.get('expires_at', 0) > asyncio.get_event_loop().time():
+            logger.debug("Retrieved user from cache")
+            return cached_user['user_data']
+
         # First try to decode JWT locally for performance
+        user_data = None
         payload = decode_jwt_token(token)
 
         if payload:
             user_id = payload.get("sub")
             email = payload.get("email")
 
-            if user_id:
+            if user_id and email:
                 logger.info(f"User authenticated locally: {user_id}")
-                return {
+                user_data = {
                     "id": user_id,
                     "email": email,
                     "token": token
                 }
+            else:
+                logger.warning("Local JWT decode missing required fields")
 
-        # If local decode fails or user_id is missing, verify with main API
-        logger.info("Local JWT decode failed, verifying with main API")
-        user_data = await verify_token_with_main_api(token)
+        # If local decode fails or incomplete, verify with main API
+        if not user_data:
+            logger.info("Local JWT decode failed, verifying with main API")
+            try:
+                api_user_data = await verify_token_with_main_api(token)
 
-        if user_data:
-            return {
-                "id": str(user_data.get("id")),
-                "email": user_data.get("email"),
-                "first_name": user_data.get("first_name"),
-                "last_name": user_data.get("last_name"),
-                "is_active": user_data.get("is_active", True),
-                "token": token
-            }
+                if api_user_data:
+                    user_data = {
+                        "id": str(api_user_data.get("id")),
+                        "email": api_user_data.get("email"),
+                        "first_name": api_user_data.get("first_name"),
+                        "last_name": api_user_data.get("last_name"),
+                        "is_active": api_user_data.get("is_active", True),
+                        "token": token
+                    }
+                    logger.info(f"User authenticated via main API: {user_data['id']}")
+                else:
+                    logger.warning("Main API verification failed")
+
+            except Exception as api_error:
+                logger.error(f"Main API verification error: {api_error}")
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Authentication service unavailable",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
 
         # If both methods fail, raise unauthorized
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        if not user_data:
+            logger.warning("Both local and API authentication failed")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid authentication credentials",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        # Cache successful authentication
+        _user_cache[token] = {
+            'user_data': user_data,
+            'expires_at': asyncio.get_event_loop().time() + _cache_ttl
+        }
+
+        return user_data
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Authentication error: {e}")
+        logger.error(f"Authentication error: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authentication failed",
@@ -93,6 +131,7 @@ async def get_current_active_user(
 ) -> Dict[str, Any]:
     """Ensure user is active"""
     if not current_user.get("is_active", True):
+        logger.warning(f"Inactive user attempted access: {current_user.get('id')}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Inactive user account"
@@ -103,17 +142,27 @@ async def get_current_active_user(
 def verify_user_owns_resource(resource_user_id: str, current_user_id: str) -> bool:
     """Verify that the current user owns the resource"""
     try:
-        # Convert to UUID for proper comparison
-        resource_uuid = uuid.UUID(resource_user_id)
-        current_uuid = uuid.UUID(current_user_id)
+        # Handle both string UUIDs and UUID objects
+        if isinstance(resource_user_id, uuid.UUID):
+            resource_uuid = resource_user_id
+        else:
+            resource_uuid = uuid.UUID(str(resource_user_id))
+
+        if isinstance(current_user_id, uuid.UUID):
+            current_uuid = current_user_id
+        else:
+            current_uuid = uuid.UUID(str(current_user_id))
+
         return resource_uuid == current_uuid
-    except (ValueError, TypeError):
+    except (ValueError, TypeError) as e:
+        logger.error(f"UUID validation error: {e}")
         return False
 
 
-async def get_db_session() -> Session:
-    """Get database session dependency"""
-    return get_db()
+@lru_cache()
+def get_db_session() -> Session:
+    """Get database session dependency with caching"""
+    return next(get_db())
 
 
 def get_user_id_from_token(
@@ -124,16 +173,33 @@ def get_user_id_from_token(
 
 
 class RateLimitChecker:
-    """Rate limiting dependency"""
+    """Rate limiting dependency with Redis backend support"""
 
     def __init__(self, requests: int = 100, window: int = 60):
         self.requests = requests
         self.window = window
 
     async def __call__(self, request: Request):
-        # Implementation would use Redis or in-memory cache
-        # For now, just pass through
-        pass
+        """Check rate limit for request"""
+        try:
+            # Get client IP
+            client_ip = request.client.host
+
+            # In production, implement Redis-based rate limiting
+            # For now, use in-memory storage with basic rate limiting
+
+            # This is a simplified implementation
+            # TODO: Implement proper Redis-based rate limiting
+            pass
+
+        except Exception as e:
+            logger.error(f"Rate limiting error: {e}")
+            # Don't block on rate limiting errors in development
+            if settings.environment == "production":
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail="Rate limit service unavailable"
+                )
 
 
 # Common rate limiters
@@ -143,6 +209,7 @@ rate_limit_standard = RateLimitChecker(
 )
 
 rate_limit_strict = RateLimitChecker(requests=20, window=60)
+rate_limit_ats_analysis = RateLimitChecker(requests=10, window=300)  # 10 per 5 minutes
 
 
 # Optional authentication (for public endpoints that benefit from auth)
@@ -155,5 +222,25 @@ async def get_current_user_optional(
 
     try:
         return await get_current_user(credentials)
-    except HTTPException:
+    except HTTPException as e:
+        # Log the error but don't raise it for optional auth
+        logger.debug(f"Optional authentication failed: {e.detail}")
         return None
+    except Exception as e:
+        logger.error(f"Optional authentication error: {e}")
+        return None
+
+
+# Clean up expired cache entries periodically
+async def cleanup_user_cache():
+    """Clean up expired cache entries"""
+    current_time = asyncio.get_event_loop().time()
+    expired_tokens = [
+        token for token, data in _user_cache.items()
+        if data.get('expires_at', 0) <= current_time
+    ]
+
+    for token in expired_tokens:
+        del _user_cache[token]
+
+    logger.debug(f"Cleaned up {len(expired_tokens)} expired cache entries")

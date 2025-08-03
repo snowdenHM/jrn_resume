@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Integer, DateTime, ForeignKey, Index
+from sqlalchemy import Column, String, Integer, DateTime, ForeignKey, Index, Boolean
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
@@ -49,9 +49,6 @@ class ResumeSection(Base):
         nullable=False
     )
 
-    # Relationship back to resume
-    resume = relationship("Resume", back_populates="sections")
-
     # Indexes for performance
     __table_args__ = (
         Index('idx_sections_resume_order', 'resume_id', 'order_index'),
@@ -73,12 +70,6 @@ class ResumeSection(Base):
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
         }
-
-
-# Add the relationship to Resume model
-from app.models.resume import Resume
-
-Resume.sections = relationship("ResumeSection", back_populates="resume", cascade="all, delete-orphan")
 
 
 class SectionTemplate(Base):

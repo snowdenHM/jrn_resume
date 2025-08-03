@@ -6,9 +6,10 @@ import logging
 from app.repositories.resume_repository import ResumeRepository
 from app.services.validation_service import ValidationService
 from app.services.export_service import ExportService
+from app.services.template_service import TemplateService
 from app.schemas.resume import (
     ResumeCreate, ResumeUpdate, ResumeResponse, ResumeListItem,
-    ResumeValidation, ResumePreview, ResumeVersionHistory
+    ResumeValidation, ResumePreview
 )
 from app.schemas.response import PaginatedResponse
 
@@ -22,11 +23,17 @@ class ResumeService:
         self.repository = ResumeRepository(db)
         self.validation_service = ValidationService()
         self.export_service = ExportService()
+        self.template_service = TemplateService()
+        self.db = db
 
     async def create_resume(self, user_id: UUID, resume_data: ResumeCreate) -> ResumeResponse:
         """Create a new resume for user"""
         try:
             logger.info(f"Creating resume for user {user_id}: {resume_data.title}")
+
+            # Validate template ID
+            if not self.template_service.validate_template_id(resume_data.template_id or "professional"):
+                raise ValueError(f"Invalid template ID: {resume_data.template_id}")
 
             # Validate content
             validation_result = self.validation_service.validate_resume_content(
@@ -47,7 +54,7 @@ class ResumeService:
             )
 
             logger.info(f"Successfully created resume {resume.id} for user {user_id}")
-            return ResumeResponse.from_orm(resume)
+            return self._convert_to_response(resume)
 
         except ValueError:
             raise
@@ -80,19 +87,33 @@ class ResumeService:
             # Convert to list items with completeness
             resume_items = []
             for resume in resumes:
-                completeness = resume.calculate_completeness()
-
-                resume_item = ResumeListItem(
-                    id=resume.id,
-                    title=resume.title,
-                    template_id=resume.template_id,
-                    version=resume.version,
-                    is_active=resume.is_active,
-                    created_at=resume.created_at,
-                    updated_at=resume.updated_at,
-                    completeness_percentage=completeness['percentage']
-                )
-                resume_items.append(resume_item)
+                try:
+                    completeness = resume.calculate_completeness()
+                    resume_item = ResumeListItem(
+                        id=resume.id,
+                        title=resume.title,
+                        template_id=resume.template_id,
+                        version=resume.version,
+                        is_active=resume.is_active,
+                        created_at=resume.created_at,
+                        updated_at=resume.updated_at,
+                        completeness_percentage=completeness['percentage']
+                    )
+                    resume_items.append(resume_item)
+                except Exception as e:
+                    logger.error(f"Error processing resume {resume.id}: {e}")
+                    # Add resume with 0% completeness if calculation fails
+                    resume_item = ResumeListItem(
+                        id=resume.id,
+                        title=resume.title,
+                        template_id=resume.template_id,
+                        version=resume.version,
+                        is_active=resume.is_active,
+                        created_at=resume.created_at,
+                        updated_at=resume.updated_at,
+                        completeness_percentage=0
+                    )
+                    resume_items.append(resume_item)
 
             return PaginatedResponse.create(
                 items=resume_items,
@@ -115,7 +136,7 @@ class ResumeService:
                 logger.warning(f"Resume {resume_id} not found for user {user_id}")
                 return None
 
-            return ResumeResponse.from_orm(resume)
+            return self._convert_to_response(resume)
 
         except Exception as e:
             logger.error(f"Error getting resume {resume_id} for user {user_id}: {e}")
@@ -130,6 +151,10 @@ class ResumeService:
         """Update existing resume"""
         try:
             logger.info(f"Updating resume {resume_id} for user {user_id}")
+
+            # Validate template ID if provided
+            if update_data.template_id and not self.template_service.validate_template_id(update_data.template_id):
+                raise ValueError(f"Invalid template ID: {update_data.template_id}")
 
             # Validate content if provided
             if update_data.content:
@@ -163,7 +188,7 @@ class ResumeService:
                 return None
 
             logger.info(f"Successfully updated resume {resume_id} for user {user_id}")
-            return ResumeResponse.from_orm(resume)
+            return self._convert_to_response(resume)
 
         except ValueError:
             raise
@@ -210,7 +235,7 @@ class ResumeService:
                 return None
 
             logger.info(f"Successfully duplicated resume {resume_id} as {duplicated_resume.id}")
-            return ResumeResponse.from_orm(duplicated_resume)
+            return self._convert_to_response(duplicated_resume)
 
         except Exception as e:
             logger.error(f"Error duplicating resume {resume_id} for user {user_id}: {e}")
@@ -246,8 +271,8 @@ class ResumeService:
                 logger.warning(f"Resume {resume_id} not found for user {user_id}")
                 return None
 
-            # Generate HTML preview (simplified)
-            preview_html = self._generate_html_preview(resume.content)
+            # Generate HTML preview
+            preview_html = self._generate_html_preview(resume.content, resume.template_id)
 
             # Get completeness info
             completeness = resume.calculate_completeness()
@@ -315,7 +340,7 @@ class ResumeService:
         try:
             logger.info(f"Searching resumes for user {user_id} with term: {search_term}")
 
-            resumes = self.repository.search_resumes(
+            resumes, total = self.repository.search_resumes(
                 user_id=user_id,
                 search_term=search_term,
                 page=page,
@@ -325,22 +350,21 @@ class ResumeService:
             # Convert to list items
             resume_items = []
             for resume in resumes:
-                completeness = resume.calculate_completeness()
-
-                resume_item = ResumeListItem(
-                    id=resume.id,
-                    title=resume.title,
-                    template_id=resume.template_id,
-                    version=resume.version,
-                    is_active=resume.is_active,
-                    created_at=resume.created_at,
-                    updated_at=resume.updated_at,
-                    completeness_percentage=completeness['percentage']
-                )
-                resume_items.append(resume_item)
-
-            # For search, we'll use the actual count as total
-            total = len(resumes)
+                try:
+                    completeness = resume.calculate_completeness()
+                    resume_item = ResumeListItem(
+                        id=resume.id,
+                        title=resume.title,
+                        template_id=resume.template_id,
+                        version=resume.version,
+                        is_active=resume.is_active,
+                        created_at=resume.created_at,
+                        updated_at=resume.updated_at,
+                        completeness_percentage=completeness['percentage']
+                    )
+                    resume_items.append(resume_item)
+                except Exception as e:
+                    logger.error(f"Error processing search result for resume {resume.id}: {e}")
 
             return PaginatedResponse.create(
                 items=resume_items,
@@ -373,15 +397,24 @@ class ResumeService:
                 fully_complete_count = 0
 
                 for resume in active_resumes:
-                    completeness = resume.calculate_completeness()
-                    total_completeness += completeness['percentage']
-                    if completeness['percentage'] == 100:
-                        fully_complete_count += 1
+                    try:
+                        completeness = resume.calculate_completeness()
+                        total_completeness += completeness['percentage']
+                        if completeness['percentage'] == 100:
+                            fully_complete_count += 1
+                    except Exception as e:
+                        logger.error(f"Error calculating completeness for resume {resume.id}: {e}")
 
-                stats.update({
-                    'average_completeness': round(total_completeness / stats['active_resumes'], 1),
-                    'fully_complete_resumes': fully_complete_count
-                })
+                if active_resumes:
+                    stats.update({
+                        'average_completeness': round(total_completeness / len(active_resumes), 1),
+                        'fully_complete_resumes': fully_complete_count
+                    })
+                else:
+                    stats.update({
+                        'average_completeness': 0,
+                        'fully_complete_resumes': 0
+                    })
             else:
                 stats.update({
                     'average_completeness': 0,
@@ -394,71 +427,209 @@ class ResumeService:
             logger.error(f"Error getting resume stats for user {user_id}: {e}")
             raise
 
-    def _generate_html_preview(self, content: Dict[str, Any]) -> str:
+    def _convert_to_response(self, resume) -> ResumeResponse:
+        """Convert resume model to response schema"""
+        try:
+            from app.schemas.resume import ResumeContent, PersonalInfo, Skills
+
+            # Parse content into structured format
+            content_dict = resume.content
+
+            # Create ResumeContent object with proper validation
+            resume_content = ResumeContent(
+                personal_info=PersonalInfo(**content_dict.get('personal_info', {})),
+                professional_summary=content_dict.get('professional_summary'),
+                work_experience=content_dict.get('work_experience', []),
+                education=content_dict.get('education', []),
+                skills=Skills(**content_dict.get('skills', {})),
+                certifications=content_dict.get('certifications', []),
+                projects=content_dict.get('projects', []),
+                languages=content_dict.get('languages', []),
+                additional_sections=content_dict.get('additional_sections', {})
+            )
+
+            return ResumeResponse(
+                id=resume.id,
+                user_id=resume.user_id,
+                title=resume.title,
+                template_id=resume.template_id,
+                content=resume_content,
+                version=resume.version,
+                is_active=resume.is_active,
+                created_at=resume.created_at,
+                updated_at=resume.updated_at
+            )
+        except Exception as e:
+            logger.error(f"Error converting resume to response: {e}")
+            # Return minimal response if conversion fails
+            from app.schemas.resume import ResumeContent, PersonalInfo, Skills
+
+            return ResumeResponse(
+                id=resume.id,
+                user_id=resume.user_id,
+                title=resume.title,
+                template_id=resume.template_id,
+                content=ResumeContent(
+                    personal_info=PersonalInfo(
+                        first_name="",
+                        last_name="",
+                        email="",
+                        phone=""
+                    ),
+                    skills=Skills()
+                ),
+                version=resume.version,
+                is_active=resume.is_active,
+                created_at=resume.created_at,
+                updated_at=resume.updated_at
+            )
+
+    def _generate_html_preview(self, content: Dict[str, Any], template_id: str = "professional") -> str:
         """Generate HTML preview of resume content"""
         try:
-            html_parts = ['<div class="resume-preview">']
+            # Get template styling
+            template = self.template_service.get_template(template_id)
+            styling = template.get('styling', {}) if template else {}
+
+            html_parts = [
+                '<div class="resume-preview" style="font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px;">']
 
             # Personal info
             personal_info = content.get('personal_info', {})
             if personal_info:
                 full_name = f"{personal_info.get('first_name', '')} {personal_info.get('last_name', '')}"
-                html_parts.append(f'<h1 class="name">{full_name.strip()}</h1>')
+                html_parts.append(
+                    f'<h1 style="color: #2E4057; text-align: center; margin-bottom: 5px;">{full_name.strip()}</h1>')
 
                 contact_info = []
                 if personal_info.get('email'):
                     contact_info.append(personal_info['email'])
                 if personal_info.get('phone'):
                     contact_info.append(personal_info['phone'])
+                if personal_info.get('address'):
+                    contact_info.append(personal_info['address'])
 
                 if contact_info:
-                    html_parts.append(f'<p class="contact">{" | ".join(contact_info)}</p>')
+                    html_parts.append(
+                        f'<p style="text-align: center; color: #666; margin-bottom: 20px;">{" | ".join(contact_info)}</p>')
+
+                # Links
+                links = []
+                if personal_info.get('linkedin_url'):
+                    links.append(f'<a href="{personal_info["linkedin_url"]}" style="color: #2E4057;">LinkedIn</a>')
+                if personal_info.get('portfolio_url'):
+                    links.append(f'<a href="{personal_info["portfolio_url"]}" style="color: #2E4057;">Portfolio</a>')
+                if personal_info.get('github_url'):
+                    links.append(f'<a href="{personal_info["github_url"]}" style="color: #2E4057;">GitHub</a>')
+
+                if links:
+                    html_parts.append(f'<p style="text-align: center; margin-bottom: 30px;">{" | ".join(links)}</p>')
 
             # Professional summary
             if content.get('professional_summary'):
-                html_parts.append('<h2>Professional Summary</h2>')
-                html_parts.append(f'<p>{content["professional_summary"]}</p>')
+                html_parts.append(
+                    '<h2 style="color: #2E4057; border-bottom: 2px solid #2E4057; padding-bottom: 5px;">Professional Summary</h2>')
+                html_parts.append(
+                    f'<p style="text-align: justify; margin-bottom: 25px;">{content["professional_summary"]}</p>')
 
             # Work experience
             work_exp = content.get('work_experience', [])
             if work_exp:
-                html_parts.append('<h2>Work Experience</h2>')
+                html_parts.append(
+                    '<h2 style="color: #2E4057; border-bottom: 2px solid #2E4057; padding-bottom: 5px;">Work Experience</h2>')
                 for job in work_exp:
-                    html_parts.append(f'<h3>{job.get("job_title", "")} at {job.get("company", "")}</h3>')
+                    html_parts.append(f'<div style="margin-bottom: 20px;">')
+                    html_parts.append(
+                        f'<h3 style="color: #2E4057; margin-bottom: 5px;">{job.get("job_title", "")} - {job.get("company", "")}</h3>')
 
                     dates = f"{job.get('start_date', '')} - {job.get('end_date', 'Present')}"
-                    html_parts.append(f'<p class="dates">{dates}</p>')
+                    location = job.get('location', '')
+                    if location:
+                        dates += f" | {location}"
+                    html_parts.append(f'<p style="color: #888; margin-bottom: 10px;">{dates}</p>')
 
                     responsibilities = job.get('responsibilities', [])
                     if responsibilities:
-                        html_parts.append('<ul>')
+                        html_parts.append('<ul style="margin-bottom: 15px;">')
                         for resp in responsibilities[:3]:  # Show first 3
-                            html_parts.append(f'<li>{resp}</li>')
+                            html_parts.append(f'<li style="margin-bottom: 3px;">{resp}</li>')
+                        if len(responsibilities) > 3:
+                            html_parts.append(
+                                f'<li style="color: #888; font-style: italic;">... and {len(responsibilities) - 3} more</li>')
                         html_parts.append('</ul>')
+                    html_parts.append('</div>')
 
             # Education
             education = content.get('education', [])
             if education:
-                html_parts.append('<h2>Education</h2>')
+                html_parts.append(
+                    '<h2 style="color: #2E4057; border-bottom: 2px solid #2E4057; padding-bottom: 5px;">Education</h2>')
                 for edu in education:
-                    html_parts.append(f'<h3>{edu.get("degree", "")} - {edu.get("institution", "")}</h3>')
+                    html_parts.append('<div style="margin-bottom: 15px;">')
+                    html_parts.append(
+                        f'<h3 style="color: #2E4057; margin-bottom: 5px;">{edu.get("degree", "")} - {edu.get("institution", "")}</h3>')
+
+                    edu_details = []
                     if edu.get('graduation_year'):
-                        html_parts.append(f'<p class="dates">{edu["graduation_year"]}</p>')
+                        edu_details.append(f"Graduated: {edu['graduation_year']}")
+                    if edu.get('gpa'):
+                        edu_details.append(f"GPA: {edu['gpa']}")
+                    if edu.get('field_of_study'):
+                        edu_details.append(f"Field: {edu['field_of_study']}")
+
+                    if edu_details:
+                        html_parts.append(f'<p style="color: #888; margin-bottom: 5px;">{" | ".join(edu_details)}</p>')
+                    html_parts.append('</div>')
 
             # Skills
             skills = content.get('skills', {})
-            if skills:
-                html_parts.append('<h2>Skills</h2>')
+            if skills and any(skills.values()):
+                html_parts.append(
+                    '<h2 style="color: #2E4057; border-bottom: 2px solid #2E4057; padding-bottom: 5px;">Skills</h2>')
                 for category, skill_list in skills.items():
-                    if skill_list:
+                    if skill_list and isinstance(skill_list, list):
                         category_name = category.replace('_', ' ').title()
                         skills_text = ', '.join(skill_list)
-                        html_parts.append(f'<p><strong>{category_name}:</strong> {skills_text}</p>')
+                        html_parts.append(
+                            f'<p style="margin-bottom: 8px;"><strong>{category_name}:</strong> {skills_text}</p>')
+
+            # Projects
+            projects = content.get('projects', [])
+            if projects:
+                html_parts.append(
+                    '<h2 style="color: #2E4057; border-bottom: 2px solid #2E4057; padding-bottom: 5px;">Projects</h2>')
+                for project in projects[:3]:  # Show first 3 projects
+                    html_parts.append('<div style="margin-bottom: 15px;">')
+                    html_parts.append(f'<h3 style="color: #2E4057; margin-bottom: 5px;">{project.get("name", "")}</h3>')
+                    if project.get('description'):
+                        html_parts.append(f'<p style="margin-bottom: 5px;">{project["description"]}</p>')
+
+                    technologies = project.get('technologies', [])
+                    if technologies:
+                        html_parts.append(
+                            f'<p style="color: #666; font-size: 0.9em;"><strong>Technologies:</strong> {", ".join(technologies)}</p>')
+                    html_parts.append('</div>')
+
+            # Certifications
+            certifications = content.get('certifications', [])
+            if certifications:
+                html_parts.append(
+                    '<h2 style="color: #2E4057; border-bottom: 2px solid #2E4057; padding-bottom: 5px;">Certifications</h2>')
+                for cert in certifications:
+                    html_parts.append('<div style="margin-bottom: 10px;">')
+                    html_parts.append(f'<h4 style="color: #2E4057; margin-bottom: 2px;">{cert.get("name", "")}</h4>')
+                    cert_details = []
+                    if cert.get('issuer'):
+                        cert_details.append(cert['issuer'])
+                    if cert.get('issue_date'):
+                        cert_details.append(f"Issued: {cert['issue_date']}")
+                    if cert_details:
+                        html_parts.append(f'<p style="color: #888; font-size: 0.9em;">{" | ".join(cert_details)}</p>')
+                    html_parts.append('</div>')
 
             html_parts.append('</div>')
-
             return ''.join(html_parts)
 
         except Exception as e:
             logger.error(f"Error generating HTML preview: {e}")
-            return '<div class="resume-preview"><p>Preview not available</p></div>'
+            return f'<div class="resume-preview" style="padding: 20px; color: #666;"><p>Preview generation failed: {str(e)}</p><p>Please check your resume content and try again.</p></div>'

@@ -1,6 +1,6 @@
 from typing import List, Optional, Dict, Any
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, desc, func
+from sqlalchemy import and_, desc, func, or_
 from uuid import UUID
 import logging
 
@@ -194,21 +194,37 @@ class ResumeRepository(BaseRepository[Resume]):
             search_term: str,
             page: int = 1,
             size: int = 10
-    ) -> List[Resume]:
-        """Search user's resumes by title or content"""
+    ) -> tuple[List[Resume], int]:
+        """Search user's resumes by title or content with count"""
         try:
             skip = (page - 1) * size
 
-            return self.db.query(Resume).filter(
+            # Build base query
+            base_query = self.db.query(Resume).filter(
                 and_(
                     Resume.user_id == user_id,
-                    Resume.is_active == True,
-                    or_(
-                        Resume.title.ilike(f"%{search_term}%"),
-                        Resume.content.astext.ilike(f"%{search_term}%")
-                    )
+                    Resume.is_active == True
                 )
-            ).order_by(desc(Resume.updated_at)).offset(skip).limit(size).all()
+            )
+
+            # Add search conditions
+            search_conditions = or_(
+                Resume.title.ilike(f"%{search_term}%"),
+                Resume.content.astext.ilike(f"%{search_term}%")
+            )
+
+            # Get count for pagination
+            total_count = base_query.filter(search_conditions).count()
+
+            # Get results with pagination
+            results = base_query.filter(search_conditions)\
+                .order_by(desc(Resume.updated_at))\
+                .offset(skip)\
+                .limit(size)\
+                .all()
+
+            return results, total_count
+
         except Exception as e:
             logger.error(f"Error searching resumes for user {user_id}: {e}")
             raise
@@ -228,6 +244,17 @@ class ResumeRepository(BaseRepository[Resume]):
                 )
             ).order_by(desc(Resume.updated_at)).first()
 
+            # Get template usage stats
+            template_stats = self.db.query(
+                Resume.template_id,
+                func.count(Resume.id).label('count')
+            ).filter(
+                and_(
+                    Resume.user_id == user_id,
+                    Resume.is_active == True
+                )
+            ).group_by(Resume.template_id).all()
+
             return {
                 "total_resumes": total_resumes,
                 "active_resumes": active_resumes,
@@ -236,7 +263,11 @@ class ResumeRepository(BaseRepository[Resume]):
                     "id": str(latest_resume.id),
                     "title": latest_resume.title,
                     "updated_at": latest_resume.updated_at
-                } if latest_resume else None
+                } if latest_resume else None,
+                "template_usage": [
+                    {"template_id": stat.template_id, "count": stat.count}
+                    for stat in template_stats
+                ]
             }
         except Exception as e:
             logger.error(f"Error getting resume stats for user {user_id}: {e}")
@@ -268,4 +299,30 @@ class ResumeRepository(BaseRepository[Resume]):
         except Exception as e:
             logger.error(f"Error bulk updating template: {e}")
             self.db.rollback()
+            raise
+
+    def get_resumes_by_date_range(
+            self,
+            user_id: UUID,
+            start_date,
+            end_date,
+            is_active: Optional[bool] = None
+    ) -> List[Resume]:
+        """Get resumes created within date range"""
+        try:
+            query = self.db.query(Resume).filter(
+                and_(
+                    Resume.user_id == user_id,
+                    Resume.created_at >= start_date,
+                    Resume.created_at <= end_date
+                )
+            )
+
+            if is_active is not None:
+                query = query.filter(Resume.is_active == is_active)
+
+            return query.order_by(desc(Resume.created_at)).all()
+
+        except Exception as e:
+            logger.error(f"Error getting resumes by date range for user {user_id}: {e}")
             raise
