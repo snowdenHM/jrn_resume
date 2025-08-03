@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api.v1.endpoints import resumes, templates, export, ats_analysis
+from app.api.v1.endpoints import resumes, templates, export, ats_analysis, cover_letters
 
 # Create main API router
 api_router = APIRouter()
@@ -10,6 +10,12 @@ api_router.include_router(
     resumes.router,
     prefix="/resumes",
     tags=["resumes"]
+)
+
+api_router.include_router(
+    cover_letters.router,
+    prefix="/cover-letters",
+    tags=["cover-letters"]
 )
 
 api_router.include_router(

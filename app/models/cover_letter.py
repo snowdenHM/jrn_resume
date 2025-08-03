@@ -209,9 +209,3 @@ class CoverLetterTemplate(Base):
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
         }
-
-
-# Add relationship to Resume model
-from app.models.resume import Resume
-
-Resume.cover_letters = relationship("CoverLetter", back_populates="resume")

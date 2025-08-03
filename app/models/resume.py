@@ -45,8 +45,9 @@ class Resume(Base):
         nullable=False
     )
 
-    # Relationship to sections (will be defined after ResumeSection is imported)
+    # Relationships
     sections = relationship("ResumeSection", back_populates="resume", cascade="all, delete-orphan")
+    cover_letters = relationship("CoverLetter", back_populates="resume", cascade="all, delete-orphan")
 
     # Indexes for performance
     __table_args__ = (

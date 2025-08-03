@@ -9,12 +9,14 @@ from io import BytesIO
 from typing import Dict, List, Any, Optional
 import logging
 import os
+import html
+import re
 
 logger = logging.getLogger(__name__)
 
 
 class ResumePDFGenerator:
-    """PDF generator for resume documents with error handling and validation"""
+    """PDF generator for resume documents with comprehensive error handling and validation"""
 
     def __init__(self, pagesize=letter):
         self.pagesize = pagesize
@@ -22,8 +24,11 @@ class ResumePDFGenerator:
         self._setup_custom_styles()
         self._validate_fonts()
 
+        # Memory management
+        self._temp_files = []
+
     def _validate_fonts(self):
-        """Validate that required fonts are available"""
+        """Validate that required fonts are available with fallbacks"""
         try:
             # Test font availability by creating a small document
             from reportlab.pdfbase import pdfmetrics
@@ -36,12 +41,35 @@ class ResumePDFGenerator:
             missing_fonts = [font for font in required_fonts if font not in available_fonts]
             if missing_fonts:
                 logger.warning(f"Some fonts not available: {missing_fonts}. Using fallbacks.")
+                # Register fallback fonts if needed
+                self._register_fallback_fonts()
 
         except Exception as e:
             logger.warning(f"Font validation failed: {e}. Using default fonts.")
+            self._register_fallback_fonts()
+
+    def _register_fallback_fonts(self):
+        """Register fallback fonts if primary fonts are unavailable"""
+        try:
+            from reportlab.pdfbase import pdfmetrics
+            from reportlab.pdfbase.ttfonts import TTFont
+
+            # Try to register basic fonts as fallbacks
+            fallback_mappings = {
+                'Helvetica': 'Times-Roman',
+                'Helvetica-Bold': 'Times-Bold',
+                'Helvetica-Oblique': 'Times-Italic'
+            }
+
+            for preferred, fallback in fallback_mappings.items():
+                if preferred not in pdfmetrics.getRegisteredFontNames():
+                    logger.info(f"Using {fallback} as fallback for {preferred}")
+
+        except Exception as e:
+            logger.error(f"Error registering fallback fonts: {e}")
 
     def _setup_custom_styles(self):
-        """Setup custom paragraph styles for resume"""
+        """Setup custom paragraph styles for resume with error handling"""
         try:
             # Main title style
             self.styles.add(ParagraphStyle(
@@ -143,10 +171,11 @@ class ResumePDFGenerator:
 
         except Exception as e:
             logger.error(f"Error setting up custom styles: {e}")
-            # Use default styles if custom setup fails
+            # Continue with default styles if custom setup fails
 
     def generate_resume_pdf(self, resume_content: Dict[str, Any], title: str = "Resume") -> BytesIO:
         """Generate PDF from resume content with comprehensive error handling"""
+        buffer = None
         try:
             # Validate input
             if not resume_content:
@@ -159,6 +188,9 @@ class ResumePDFGenerator:
             personal_info = resume_content.get('personal_info', {})
             if not personal_info:
                 raise ValueError("Resume must contain personal information")
+
+            if not isinstance(personal_info, dict):
+                raise ValueError("Personal information must be a dictionary")
 
             # Create buffer and document
             buffer = BytesIO()
@@ -240,9 +272,13 @@ class ResumePDFGenerator:
                 raise ValueError(f"Failed to generate PDF: {str(e)}")
 
         except ValueError:
+            if buffer:
+                buffer.close()
             raise
         except Exception as e:
-            logger.error(f"Unexpected error generating PDF: {e}")
+            if buffer:
+                buffer.close()
+            logger.error(f"Unexpected error generating PDF: {e}", exc_info=True)
             raise ValueError(f"PDF generation failed: {str(e)}")
 
     def _sanitize_title(self, title: str) -> str:
@@ -258,8 +294,8 @@ class ResumePDFGenerator:
         """Add header with personal information"""
         try:
             # Full name
-            first_name = personal_info.get('first_name', '').strip()
-            last_name = personal_info.get('last_name', '').strip()
+            first_name = self._safe_get_string(personal_info, 'first_name')
+            last_name = self._safe_get_string(personal_info, 'last_name')
 
             if not first_name and not last_name:
                 full_name = "Name Not Provided"
@@ -270,12 +306,16 @@ class ResumePDFGenerator:
 
             # Contact information
             contact_parts = []
-            if personal_info.get('email'):
-                contact_parts.append(self._escape_xml(personal_info['email']))
-            if personal_info.get('phone'):
-                contact_parts.append(self._escape_xml(personal_info['phone']))
-            if personal_info.get('address'):
-                contact_parts.append(self._escape_xml(personal_info['address']))
+            email = self._safe_get_string(personal_info, 'email')
+            phone = self._safe_get_string(personal_info, 'phone')
+            address = self._safe_get_string(personal_info, 'address')
+
+            if email:
+                contact_parts.append(self._escape_xml(email))
+            if phone:
+                contact_parts.append(self._escape_xml(phone))
+            if address:
+                contact_parts.append(self._escape_xml(address))
 
             if contact_parts:
                 contact_info = ' | '.join(contact_parts)
@@ -283,12 +323,16 @@ class ResumePDFGenerator:
 
             # Links
             link_parts = []
-            if personal_info.get('linkedin_url'):
-                link_parts.append(f"LinkedIn: {self._escape_xml(personal_info['linkedin_url'])}")
-            if personal_info.get('portfolio_url'):
-                link_parts.append(f"Portfolio: {self._escape_xml(personal_info['portfolio_url'])}")
-            if personal_info.get('github_url'):
-                link_parts.append(f"GitHub: {self._escape_xml(personal_info['github_url'])}")
+            linkedin_url = self._safe_get_string(personal_info, 'linkedin_url')
+            portfolio_url = self._safe_get_string(personal_info, 'portfolio_url')
+            github_url = self._safe_get_string(personal_info, 'github_url')
+
+            if linkedin_url:
+                link_parts.append(f"LinkedIn: {self._escape_xml(linkedin_url)}")
+            if portfolio_url:
+                link_parts.append(f"Portfolio: {self._escape_xml(portfolio_url)}")
+            if github_url:
+                link_parts.append(f"GitHub: {self._escape_xml(github_url)}")
 
             if link_parts:
                 links_info = ' | '.join(link_parts)
@@ -306,7 +350,7 @@ class ResumePDFGenerator:
                 return
 
             story.append(Paragraph("Professional Summary", self.styles['SectionTitle']))
-            cleaned_summary = self._escape_xml(summary.strip())
+            cleaned_summary = self._escape_xml(self._safe_get_string({'summary': summary}, 'summary'))
             story.append(Paragraph(cleaned_summary, self.styles['Summary']))
 
         except Exception as e:
@@ -315,27 +359,32 @@ class ResumePDFGenerator:
     def _add_work_experience(self, story: List, work_experience: List[Dict[str, Any]]):
         """Add work experience section"""
         try:
-            if not work_experience:
+            if not work_experience or not isinstance(work_experience, list):
                 return
 
             story.append(Paragraph("Work Experience", self.styles['SectionTitle']))
 
-            for job in work_experience:
+            for i, job in enumerate(work_experience):
                 try:
+                    if not isinstance(job, dict):
+                        logger.warning(f"Skipping invalid work experience entry at index {i}")
+                        continue
+
                     # Job title
-                    job_title = self._escape_xml(job.get('job_title', 'Position Title'))
-                    story.append(Paragraph(job_title, self.styles['JobTitle']))
+                    job_title = self._safe_get_string(job, 'job_title', 'Position Title')
+                    story.append(Paragraph(self._escape_xml(job_title), self.styles['JobTitle']))
 
                     # Company and location
-                    company_info = self._escape_xml(job.get('company', 'Company'))
-                    location = job.get('location', '').strip()
+                    company = self._safe_get_string(job, 'company', 'Company')
+                    location = self._safe_get_string(job, 'location')
+                    company_info = self._escape_xml(company)
                     if location:
                         company_info += f" - {self._escape_xml(location)}"
                     story.append(Paragraph(company_info, self.styles['CompanyName']))
 
                     # Dates
-                    start_date = job.get('start_date', '').strip()
-                    end_date = job.get('end_date', '').strip() or 'Present'
+                    start_date = self._safe_get_string(job, 'start_date')
+                    end_date = self._safe_get_string(job, 'end_date', 'Present')
                     if start_date:
                         date_range = f"{self._escape_xml(start_date)} - {self._escape_xml(end_date)}"
                         story.append(Paragraph(date_range, self.styles['DateStyle']))
@@ -344,14 +393,14 @@ class ResumePDFGenerator:
                     responsibilities = job.get('responsibilities', [])
                     if isinstance(responsibilities, list):
                         for responsibility in responsibilities:
-                            if responsibility and responsibility.strip():
-                                bullet_text = f"• {self._escape_xml(responsibility.strip())}"
+                            if responsibility and str(responsibility).strip():
+                                bullet_text = f"• {self._escape_xml(str(responsibility).strip())}"
                                 story.append(Paragraph(bullet_text, self.styles['BulletPoint']))
 
                     story.append(Spacer(1, 10))
 
                 except Exception as job_error:
-                    logger.error(f"Error processing work experience entry: {job_error}")
+                    logger.error(f"Error processing work experience entry {i}: {job_error}")
                     continue
 
         except Exception as e:
@@ -360,48 +409,58 @@ class ResumePDFGenerator:
     def _add_education(self, story: List, education: List[Dict[str, Any]]):
         """Add education section"""
         try:
-            if not education:
+            if not education or not isinstance(education, list):
                 return
 
             story.append(Paragraph("Education", self.styles['SectionTitle']))
 
-            for edu in education:
+            for i, edu in enumerate(education):
                 try:
+                    if not isinstance(edu, dict):
+                        logger.warning(f"Skipping invalid education entry at index {i}")
+                        continue
+
                     # Degree
-                    degree = self._escape_xml(edu.get('degree', 'Degree'))
-                    story.append(Paragraph(degree, self.styles['JobTitle']))
+                    degree = self._safe_get_string(edu, 'degree', 'Degree')
+                    story.append(Paragraph(self._escape_xml(degree), self.styles['JobTitle']))
 
                     # Institution and location
-                    institution_info = self._escape_xml(edu.get('institution', 'Institution'))
-                    location = edu.get('location', '').strip()
+                    institution = self._safe_get_string(edu, 'institution', 'Institution')
+                    location = self._safe_get_string(edu, 'location')
+                    institution_info = self._escape_xml(institution)
                     if location:
                         institution_info += f" - {self._escape_xml(location)}"
                     story.append(Paragraph(institution_info, self.styles['CompanyName']))
 
                     # Graduation year and GPA
                     grad_info = []
-                    if edu.get('graduation_year'):
-                        grad_info.append(f"Graduated: {self._escape_xml(str(edu['graduation_year']))}")
-                    if edu.get('gpa'):
-                        grad_info.append(f"GPA: {self._escape_xml(str(edu['gpa']))}")
+                    graduation_year = self._safe_get_string(edu, 'graduation_year')
+                    gpa = edu.get('gpa')
+
+                    if graduation_year:
+                        grad_info.append(f"Graduated: {self._escape_xml(graduation_year)}")
+                    if gpa:
+                        grad_info.append(f"GPA: {self._escape_xml(str(gpa))}")
 
                     if grad_info:
                         story.append(Paragraph(' | '.join(grad_info), self.styles['DateStyle']))
 
                     # Field of study
-                    if edu.get('field_of_study'):
-                        field_text = f"Field of Study: {self._escape_xml(edu['field_of_study'])}"
+                    field_of_study = self._safe_get_string(edu, 'field_of_study')
+                    if field_of_study:
+                        field_text = f"Field of Study: {self._escape_xml(field_of_study)}"
                         story.append(Paragraph(field_text, self.styles['Normal']))
 
                     # Honors
-                    if edu.get('honors'):
-                        honors_text = f"Honors: {self._escape_xml(edu['honors'])}"
+                    honors = self._safe_get_string(edu, 'honors')
+                    if honors:
+                        honors_text = f"Honors: {self._escape_xml(honors)}"
                         story.append(Paragraph(honors_text, self.styles['Normal']))
 
                     story.append(Spacer(1, 10))
 
                 except Exception as edu_error:
-                    logger.error(f"Error processing education entry: {edu_error}")
+                    logger.error(f"Error processing education entry {i}: {edu_error}")
                     continue
 
         except Exception as e:
@@ -410,7 +469,7 @@ class ResumePDFGenerator:
     def _add_skills(self, story: List, skills: Dict[str, List[str]]):
         """Add skills section"""
         try:
-            if not skills or not any(skills.values()):
+            if not skills or not isinstance(skills, dict) or not any(skills.values()):
                 return
 
             story.append(Paragraph("Skills", self.styles['SectionTitle']))
@@ -418,12 +477,15 @@ class ResumePDFGenerator:
             for skill_category, skill_list in skills.items():
                 try:
                     if skill_list and isinstance(skill_list, list):
-                        category_title = skill_category.replace('_', ' ').title()
+                        category_title = str(skill_category).replace('_', ' ').title()
                         story.append(Paragraph(f"{self._escape_xml(category_title)}:", self.styles['SkillCategory']))
 
                         # Clean and escape skills
-                        clean_skills = [self._escape_xml(skill.strip()) for skill in skill_list if
-                                        skill and skill.strip()]
+                        clean_skills = []
+                        for skill in skill_list:
+                            if skill and str(skill).strip():
+                                clean_skills.append(self._escape_xml(str(skill).strip()))
+
                         if clean_skills:
                             skills_text = ', '.join(clean_skills)
                             story.append(Paragraph(skills_text, self.styles['Normal']))
@@ -439,25 +501,29 @@ class ResumePDFGenerator:
     def _add_certifications(self, story: List, certifications: List[Dict[str, Any]]):
         """Add certifications section"""
         try:
-            if not certifications:
+            if not certifications or not isinstance(certifications, list):
                 return
 
             story.append(Paragraph("Certifications", self.styles['SectionTitle']))
 
-            for cert in certifications:
+            for i, cert in enumerate(certifications):
                 try:
+                    if not isinstance(cert, dict):
+                        logger.warning(f"Skipping invalid certification entry at index {i}")
+                        continue
+
                     # Certification name
-                    cert_name = self._escape_xml(cert.get('name', 'Certification'))
-                    story.append(Paragraph(cert_name, self.styles['JobTitle']))
+                    cert_name = self._safe_get_string(cert, 'name', 'Certification')
+                    story.append(Paragraph(self._escape_xml(cert_name), self.styles['JobTitle']))
 
                     # Issuer
-                    issuer = cert.get('issuer', '').strip()
+                    issuer = self._safe_get_string(cert, 'issuer')
                     if issuer:
                         story.append(Paragraph(self._escape_xml(issuer), self.styles['CompanyName']))
 
                     # Dates
-                    issue_date = cert.get('issue_date', '').strip()
-                    expiry_date = cert.get('expiry_date', '').strip()
+                    issue_date = self._safe_get_string(cert, 'issue_date')
+                    expiry_date = self._safe_get_string(cert, 'expiry_date')
                     if issue_date:
                         date_text = f"Issued: {self._escape_xml(issue_date)}"
                         if expiry_date:
@@ -465,14 +531,15 @@ class ResumePDFGenerator:
                         story.append(Paragraph(date_text, self.styles['DateStyle']))
 
                     # Credential ID
-                    if cert.get('credential_id'):
-                        cred_text = f"Credential ID: {self._escape_xml(cert['credential_id'])}"
+                    credential_id = self._safe_get_string(cert, 'credential_id')
+                    if credential_id:
+                        cred_text = f"Credential ID: {self._escape_xml(credential_id)}"
                         story.append(Paragraph(cred_text, self.styles['Normal']))
 
                     story.append(Spacer(1, 10))
 
                 except Exception as cert_error:
-                    logger.error(f"Error processing certification: {cert_error}")
+                    logger.error(f"Error processing certification {i}: {cert_error}")
                     continue
 
         except Exception as e:
@@ -481,36 +548,47 @@ class ResumePDFGenerator:
     def _add_projects(self, story: List, projects: List[Dict[str, Any]]):
         """Add projects section"""
         try:
-            if not projects:
+            if not projects or not isinstance(projects, list):
                 return
 
             story.append(Paragraph("Projects", self.styles['SectionTitle']))
 
-            for project in projects:
+            for i, project in enumerate(projects):
                 try:
+                    if not isinstance(project, dict):
+                        logger.warning(f"Skipping invalid project entry at index {i}")
+                        continue
+
                     # Project name
-                    project_name = self._escape_xml(project.get('name', 'Project'))
-                    story.append(Paragraph(project_name, self.styles['JobTitle']))
+                    project_name = self._safe_get_string(project, 'name', 'Project')
+                    story.append(Paragraph(self._escape_xml(project_name), self.styles['JobTitle']))
 
                     # Description
-                    description = project.get('description', '').strip()
+                    description = self._safe_get_string(project, 'description')
                     if description:
                         story.append(Paragraph(self._escape_xml(description), self.styles['Normal']))
 
                     # Technologies
                     technologies = project.get('technologies', [])
                     if isinstance(technologies, list) and technologies:
-                        clean_techs = [self._escape_xml(tech.strip()) for tech in technologies if tech and tech.strip()]
+                        clean_techs = []
+                        for tech in technologies:
+                            if tech and str(tech).strip():
+                                clean_techs.append(self._escape_xml(str(tech).strip()))
+
                         if clean_techs:
                             tech_text = f"Technologies: {', '.join(clean_techs)}"
                             story.append(Paragraph(tech_text, self.styles['Normal']))
 
                     # URLs
                     urls = []
-                    if project.get('url'):
-                        urls.append(f"Project URL: {self._escape_xml(project['url'])}")
-                    if project.get('github_url'):
-                        urls.append(f"GitHub: {self._escape_xml(project['github_url'])}")
+                    url = self._safe_get_string(project, 'url')
+                    github_url = self._safe_get_string(project, 'github_url')
+
+                    if url:
+                        urls.append(f"Project URL: {self._escape_xml(url)}")
+                    if github_url:
+                        urls.append(f"GitHub: {self._escape_xml(github_url)}")
 
                     if urls:
                         story.append(Paragraph(' | '.join(urls), self.styles['DateStyle']))
@@ -518,7 +596,7 @@ class ResumePDFGenerator:
                     story.append(Spacer(1, 10))
 
                 except Exception as project_error:
-                    logger.error(f"Error processing project: {project_error}")
+                    logger.error(f"Error processing project {i}: {project_error}")
                     continue
 
         except Exception as e:
@@ -527,21 +605,27 @@ class ResumePDFGenerator:
     def _add_languages(self, story: List, languages: List[Dict[str, Any]]):
         """Add languages section"""
         try:
-            if not languages:
+            if not languages or not isinstance(languages, list):
                 return
 
             story.append(Paragraph("Languages", self.styles['SectionTitle']))
 
             language_items = []
-            for lang in languages:
+            for i, lang in enumerate(languages):
                 try:
-                    language = lang.get('language', '').strip()
-                    proficiency = lang.get('proficiency', '').strip()
+                    if not isinstance(lang, dict):
+                        logger.warning(f"Skipping invalid language entry at index {i}")
+                        continue
+
+                    language = self._safe_get_string(lang, 'language')
+                    proficiency = self._safe_get_string(lang, 'proficiency')
+
                     if language and proficiency:
                         lang_text = f"{self._escape_xml(language)} ({self._escape_xml(proficiency)})"
                         language_items.append(lang_text)
+
                 except Exception as lang_error:
-                    logger.error(f"Error processing language: {lang_error}")
+                    logger.error(f"Error processing language {i}: {lang_error}")
                     continue
 
             if language_items:
@@ -553,20 +637,41 @@ class ResumePDFGenerator:
         except Exception as e:
             logger.error(f"Error adding languages: {e}")
 
+    def _safe_get_string(self, data: Dict[str, Any], key: str, default: str = "") -> str:
+        """Safely get string value from dictionary"""
+        try:
+            value = data.get(key, default)
+            if value is None:
+                return default
+            return str(value).strip()
+        except Exception as e:
+            logger.warning(f"Error getting string value for key '{key}': {e}")
+            return default
+
     def _escape_xml(self, text: str) -> str:
-        """Escape XML special characters for ReportLab"""
-        if not text or not isinstance(text, str):
+        """Escape XML special characters for ReportLab with enhanced safety"""
+        if not text:
             return ""
 
-        # ReportLab's Paragraph class requires XML escaping
-        text = str(text)
-        text = text.replace('&', '&amp;')
-        text = text.replace('<', '&lt;')
-        text = text.replace('>', '&gt;')
-        text = text.replace('"', '&quot;')
-        text = text.replace("'", '&#39;')
+        try:
+            # Convert to string and handle None
+            text = str(text) if text is not None else ""
 
-        return text
+            # Use html.escape for basic escaping
+            text = html.escape(text, quote=True)
+
+            # Additional ReportLab-specific escaping
+            text = text.replace('\r\n', '<br/>')
+            text = text.replace('\n', '<br/>')
+            text = text.replace('\r', '<br/>')
+
+            # Remove or replace problematic characters
+            text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x84\x86-\x9f]', '', text)
+
+            return text
+        except Exception as e:
+            logger.error(f"Error escaping XML: {e}")
+            return str(text) if text else ""
 
     def estimate_content_length(self, resume_content: Dict[str, Any]) -> int:
         """Estimate the content length to predict PDF pages"""
@@ -592,3 +697,23 @@ class ResumePDFGenerator:
         except Exception as e:
             logger.error(f"Error estimating content length: {e}")
             return 1000  # Default estimate
+
+    def cleanup_temp_files(self):
+        """Clean up temporary files"""
+        try:
+            for temp_file in self._temp_files:
+                try:
+                    if os.path.exists(temp_file):
+                        os.remove(temp_file)
+                except Exception as e:
+                    logger.error(f"Error removing temp file {temp_file}: {e}")
+            self._temp_files.clear()
+        except Exception as e:
+            logger.error(f"Error during temp file cleanup: {e}")
+
+    def __del__(self):
+        """Cleanup when generator is destroyed"""
+        try:
+            self.cleanup_temp_files()
+        except Exception as e:
+            logger.error(f"Error in PDF generator destructor: {e}")

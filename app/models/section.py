@@ -49,6 +49,9 @@ class ResumeSection(Base):
         nullable=False
     )
 
+    # Relationship to resume
+    resume = relationship("Resume", back_populates="sections")
+
     # Indexes for performance
     __table_args__ = (
         Index('idx_sections_resume_order', 'resume_id', 'order_index'),

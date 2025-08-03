@@ -5,7 +5,10 @@ from typing import Dict, Any, Optional
 import logging
 import uuid
 import asyncio
+import time
 from functools import lru_cache
+from collections import defaultdict
+import threading
 
 from app.core.config import settings
 from app.core.security import decode_jwt_token, verify_token_with_main_api, validate_token_format
@@ -19,6 +22,11 @@ security = HTTPBearer(auto_error=False)
 # Cache for user data to reduce API calls
 _user_cache = {}
 _cache_ttl = 300  # 5 minutes
+_cache_lock = threading.Lock()
+
+# Rate limiting storage
+_rate_limit_storage = defaultdict(list)
+_rate_limit_lock = threading.Lock()
 
 
 async def get_current_user(
@@ -48,10 +56,11 @@ async def get_current_user(
 
     try:
         # Check cache first
-        cached_user = _user_cache.get(token)
-        if cached_user and cached_user.get('expires_at', 0) > asyncio.get_event_loop().time():
-            logger.debug("Retrieved user from cache")
-            return cached_user['user_data']
+        with _cache_lock:
+            cached_user = _user_cache.get(token)
+            if cached_user and cached_user.get('expires_at', 0) > time.time():
+                logger.debug("Retrieved user from cache")
+                return cached_user['user_data']
 
         # First try to decode JWT locally for performance
         user_data = None
@@ -108,10 +117,11 @@ async def get_current_user(
             )
 
         # Cache successful authentication
-        _user_cache[token] = {
-            'user_data': user_data,
-            'expires_at': asyncio.get_event_loop().time() + _cache_ttl
-        }
+        with _cache_lock:
+            _user_cache[token] = {
+                'user_data': user_data,
+                'expires_at': time.time() + _cache_ttl
+            }
 
         return user_data
 
@@ -159,12 +169,6 @@ def verify_user_owns_resource(resource_user_id: str, current_user_id: str) -> bo
         return False
 
 
-@lru_cache()
-def get_db_session() -> Session:
-    """Get database session dependency with caching"""
-    return next(get_db())
-
-
 def get_user_id_from_token(
         current_user: Dict[str, Any] = Depends(get_current_user)
 ) -> str:
@@ -173,7 +177,7 @@ def get_user_id_from_token(
 
 
 class RateLimitChecker:
-    """Rate limiting dependency with Redis backend support"""
+    """Rate limiting dependency with in-memory backend"""
 
     def __init__(self, requests: int = 100, window: int = 60):
         self.requests = requests
@@ -183,15 +187,30 @@ class RateLimitChecker:
         """Check rate limit for request"""
         try:
             # Get client IP
-            client_ip = request.client.host
+            client_ip = request.client.host if request.client else "unknown"
+            current_time = time.time()
 
-            # In production, implement Redis-based rate limiting
-            # For now, use in-memory storage with basic rate limiting
+            with _rate_limit_lock:
+                # Clean old entries
+                cutoff_time = current_time - self.window
+                _rate_limit_storage[client_ip] = [
+                    timestamp for timestamp in _rate_limit_storage[client_ip]
+                    if timestamp > cutoff_time
+                ]
 
-            # This is a simplified implementation
-            # TODO: Implement proper Redis-based rate limiting
-            pass
+                # Check rate limit
+                if len(_rate_limit_storage[client_ip]) >= self.requests:
+                    logger.warning(f"Rate limit exceeded for IP: {client_ip}")
+                    raise HTTPException(
+                        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                        detail="Rate limit exceeded"
+                    )
 
+                # Add current request
+                _rate_limit_storage[client_ip].append(current_time)
+
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"Rate limiting error: {e}")
             # Don't block on rate limiting errors in development
@@ -234,13 +253,30 @@ async def get_current_user_optional(
 # Clean up expired cache entries periodically
 async def cleanup_user_cache():
     """Clean up expired cache entries"""
-    current_time = asyncio.get_event_loop().time()
-    expired_tokens = [
-        token for token, data in _user_cache.items()
-        if data.get('expires_at', 0) <= current_time
-    ]
+    current_time = time.time()
+    with _cache_lock:
+        expired_tokens = [
+            token for token, data in _user_cache.items()
+            if data.get('expires_at', 0) <= current_time
+        ]
 
-    for token in expired_tokens:
-        del _user_cache[token]
+        for token in expired_tokens:
+            del _user_cache[token]
 
     logger.debug(f"Cleaned up {len(expired_tokens)} expired cache entries")
+
+
+# Cleanup rate limit storage periodically
+async def cleanup_rate_limit_storage():
+    """Clean up old rate limit entries"""
+    current_time = time.time()
+    with _rate_limit_lock:
+        for ip in list(_rate_limit_storage.keys()):
+            cutoff_time = current_time - 3600  # Keep 1 hour of history
+            _rate_limit_storage[ip] = [
+                timestamp for timestamp in _rate_limit_storage[ip]
+                if timestamp > cutoff_time
+            ]
+            # Remove empty entries
+            if not _rate_limit_storage[ip]:
+                del _rate_limit_storage[ip]
